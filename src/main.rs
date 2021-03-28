@@ -10,7 +10,6 @@ use structopt::StructOpt;
 use threadpool::ThreadPool;
 
 const MAX_THREADS: usize = 50;
-const TIMEOUT: u64 = 10;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "paine", about = "What about about?")]
@@ -18,13 +17,16 @@ struct Opt {
     #[structopt(short, long)]
     verbose: bool,
 
-    #[structopt(short, long, default_value = "10")]
-    concurrent: u16,
+    #[structopt(short, long, default_value = "10", help = "requests per seconds")]
+    rate: u16,
 
-    #[structopt(short, long, default_value = "5")]
-    iterations: u16,
+    #[structopt(short, long, default_value = "10", help = "http timeout in seconds")]
+    timeout: u64,
 
-    #[structopt(short, long)]
+    #[structopt(short, long, default_value = "60", help = "test duration in seconds")]
+    duration: u64,
+
+    #[structopt(short, long, help = "target url")]
     url: String,
 }
 
@@ -32,12 +34,14 @@ struct TestPlan {
     response_times: Vec<u128>,
     status_codes: HashMap<u16, usize>,
     url: String,
-    concurrent: usize,
-    iterations: usize,
+    rate: usize,
+    duration: u64,
+    timeout_secs: u64,
     connect_errors: usize,
     timeout_errors: usize,
     other_errors: usize,
     total_elapsed: Duration,
+    total_requests: usize,
     utc: DateTime<Utc>,
     pool: ThreadPool,
 }
@@ -61,7 +65,7 @@ impl TestPlan {
     }
 
     fn total_requests(&self) -> usize {
-        self.concurrent * self.iterations
+        self.total_requests
     }
     fn total_success(&self) -> usize {
         self.response_times.len()
@@ -69,15 +73,24 @@ impl TestPlan {
 
     fn run(&mut self) {
         let (tx, rx) = channel();
+        let sleep_ms = std::time::Duration::from_secs_f64(1.0 / self.rate as f64);
 
         let now = Instant::now();
-        for _ in 0..self.concurrent {
+        loop {
+            if now.elapsed().as_secs() >= self.duration {
+                drop(tx);
+                break;
+            } else {
+                std::thread::sleep(sleep_ms);
+            }
             let tx = tx.clone();
-            let iterations = self.iterations;
+            let timeout = self.timeout_secs;
             let url = self.url.clone();
-            self.pool.execute(move || do_it(&url, iterations, tx));
+            self.pool.execute(move || do_it(&url, timeout, tx));
+            self.total_requests = self.total_requests + 1;
         }
-        for reqres in rx.iter().take(self.total_requests()) {
+
+        for reqres in rx.iter() {
             match reqres {
                 RequestResult::Success(millis, code) => {
                     self.response_times.push(millis);
@@ -104,14 +117,16 @@ impl From<Opt> for TestPlan {
             response_times: vec![],
             status_codes: HashMap::new(),
             url: opt.url,
-            concurrent: opt.concurrent as usize,
-            iterations: opt.iterations as usize,
+            timeout_secs: opt.timeout,
             connect_errors: 0,
             timeout_errors: 0,
             other_errors: 0,
             total_elapsed: Duration::new(0, 0),
             utc: Utc::now(),
-            pool: ThreadPool::new(std::cmp::min(opt.concurrent.into(), MAX_THREADS)),
+            pool: ThreadPool::new(MAX_THREADS),
+            rate: opt.rate as usize,
+            total_requests: 0,
+            duration: opt.duration,
         }
     }
 }
@@ -144,11 +159,7 @@ impl Display for TestPlan {
         write!(f, "{:>15}: {} requests\n", "Total", self.total_requests())?;
 
         // Concurrency
-        write!(
-            f,
-            "{:>15}: {} users, {} iterations/user\n",
-            "Concurrency", self.concurrent, self.iterations,
-        )?;
+        write!(f, "{:>15}: {} req/s\n", "Rate", self.rate,)?;
 
         // Status codes
         if !self.status_codes.is_empty() {
@@ -237,11 +248,11 @@ enum RequestResult {
 
 fn main() -> Result<()> {
     let opt = Opt::from_args();
-    if opt.concurrent <= 0 {
-        anyhow::bail!("<concurrent> must be greated that 0.");
+    if opt.rate <= 0 {
+        anyhow::bail!("<rate> must be greated than 0.");
     }
-    if opt.iterations <= 0 {
-        anyhow::bail!("<iterations> must be greated that 0.");
+    if opt.timeout <= 0 {
+        anyhow::bail!("<timeout> must be greated than 0.");
     }
 
     let mut plan = TestPlan::from(opt);
@@ -251,35 +262,33 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn do_it(url: &str, iterations: usize, tx: Sender<RequestResult>) {
+fn do_it(url: &str, timeout_secs: u64, tx: Sender<RequestResult>) {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(TIMEOUT))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
         .expect("unable to create http client");
-    for _ in 0..iterations {
-        let now = Instant::now();
-        match client.get(url).send() {
-            Ok(response) => {
-                if response.status().is_success() {
-                    tx.send(RequestResult::Success(
-                        now.elapsed().as_millis(),
-                        response.status().as_u16(),
-                    ))
+    let now = Instant::now();
+    match client.get(url).send() {
+        Ok(response) => {
+            if response.status().is_success() {
+                tx.send(RequestResult::Success(
+                    now.elapsed().as_millis(),
+                    response.status().as_u16(),
+                ))
+                .expect("send0 failed");
+            } else {
+                tx.send(RequestResult::ErrorStatus(response.status().into()))
                     .expect("send0 failed");
-                } else {
-                    tx.send(RequestResult::ErrorStatus(response.status().into()))
-                        .expect("send0 failed");
-                }
             }
-            Err(e) => {
-                if e.is_timeout() {
-                    tx.send(RequestResult::Timeout).expect("send0 failed");
-                } else if e.is_connect() {
-                    tx.send(RequestResult::ConnectionError)
-                        .expect("send0 failed");
-                } else {
-                    tx.send(RequestResult::OtherError).expect("send0 failed");
-                }
+        }
+        Err(e) => {
+            if e.is_timeout() {
+                tx.send(RequestResult::Timeout).expect("send0 failed");
+            } else if e.is_connect() {
+                tx.send(RequestResult::ConnectionError)
+                    .expect("send0 failed");
+            } else {
+                tx.send(RequestResult::OtherError).expect("send0 failed");
             }
         }
     }
