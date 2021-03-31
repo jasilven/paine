@@ -28,7 +28,7 @@ use tui::{
 const MAX_THREADS: usize = 50;
 
 #[derive(Debug, StructOpt)]
-#[structopt(name = "paine", about = "What about about?")]
+#[structopt(name = "paine", about = "Simple http load testing tool")]
 struct TestPlan {
     #[structopt(short, long, help = "target url")]
     url: String,
@@ -128,7 +128,7 @@ impl TestPlan {
 
             let errors = if self.total_errors() > 0 {
                 format!(
-                    "{:.1}% ({}/{}) (Connection: {}  Timeouts: {}  Others: {})",
+                    "{:.1}% ({}/{}) (Connection errors: {}  Timeouts: {}  Other errors: {})",
                     self.total_errors() / self.total_requests() * 100,
                     self.total_errors(),
                     self.total_requests(),
